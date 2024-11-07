@@ -1,0 +1,4 @@
+caps/
+__pycache__/
+*.pcap
+venv/
