@@ -418,10 +418,10 @@ def packet_handler(buf: bytes, gpsd_object: GPS):
         return
     
     incl_len = orig_len = usb.wpan_len
-    if not usb.wpan_len or usb.wpan_len == 0:
+    if not usb.wpan_len or usb.wpan_len < 4:
         return
 
-    pcaprec_hdr = struct.pack("<IIII", usb.ts_sec + usb.timestamp_epoch, usb.ts_usec, incl_len, orig_len)
+    f_out = open(outfile, 'ab')
 
     # GPS coordinates setup
     gpsLat, gpsLon, gpsAlt = 0.0, 0.0, 0.0
@@ -430,12 +430,11 @@ def packet_handler(buf: bytes, gpsd_object: GPS):
 
     # Calculate PPI header length (placeholder for actual function)
     ppi_header_len = calculate_ppi_header_length(gpsLat, gpsLon, gpsAlt)
+    #print('PPI Header length:', ppi_header_len)
+    #print('wpan_len:', usb.wpan_len)
+    #print('usb packet data len:', len(usb.packet_data))
     incl_len = orig_len = usb.wpan_len + ppi_header_len
     pcaprec_hdr = struct.pack("<IIII", usb.ts_sec + usb.timestamp_epoch, usb.ts_usec, incl_len, orig_len)
-
-    f_out = open(outfile, 'ab')
-    # Write the packet header to the pcap file
-    f_out.write(pcaprec_hdr)
 
     # Extract RSSI and LQI from the packet
     rssi_index = -2
@@ -445,21 +444,49 @@ def packet_handler(buf: bytes, gpsd_object: GPS):
     # Convert RSSI and LQI
     rssi_signed = ((rssi_unsigned + (1 << 7)) % (1 << 8)) - (1 << 7) - 73
     lqi_signed = ((lqi_unsigned + (1 << 7)) % (1 << 8)) - (1 << 7) - 73
+    if 127 < rssi_signed: rssi_signed = 127
+    if rssi_signed < -128: rssi_signed = -128
+    if 127 < lqi_signed: lqi_signed = 127
+    if lqi_signed < -128: lqi_signed = -128
     print(f"RSSI: {rssi_signed}")
 
     # Write PPI headers (placeholder for actual function) 4th is channel
-    write_ppi_headers(f_out, 0, 1, cur_channel, rssi_signed, lqi_signed, gpsLat, gpsLon, gpsAlt)
-
-    # Write the actual packet data to the file
-    f_out.write(usb.packet_data)
+    ppi = write_ppi_headers(0, 1, cur_channel, rssi_signed, lqi_signed, gpsLat, gpsLon, gpsAlt)
 
     # Compute FCS for the packet data and write it to the file
     fcs = ieee802154_crc16(usb.packet_data, 0, len(usb.packet_data) - 2)
     le_fcs = struct.pack("<H", fcs)  # htole16 equivalent
-    f_out.write(le_fcs)
+
+    # create full packet
+    full_pkt = pcaprec_hdr + ppi + usb.packet_data[:-2] + le_fcs
+
+    # write out packet to file
+    f_out.write(full_pkt)
+
     f_out.flush()
     f_out.close()
 
+    parse_packet(usb.packet_data[:-2])
+
+def parse_packet(pkt: bytes):
+    global aps, stas
+
+    offset = 0
+
+
+    offset += 2
+    if offset < len(pkt):
+        return
+    fc = struct.unpack('<H', pkt[:offset])[0]
+    
+    if offset + 1 < len(pkt):
+        return
+    seq_no = pkt[offset]
+
+    if offset + 2 < len(pkt):
+        return
+    source_pan = pkt[offset + 2] + pkt[offset + 1]
+    
 def process_packets(gpsd_object: GPS):
     global signal_exit
 
@@ -566,16 +593,16 @@ def main(args):
     display_thread.daemon = True
     display_thread.start()"""
 
+    if gpsd:
+        gpsd_object = GPS()
+        gps_thread = Thread(target=gpsd_object.start, args=('127.0.0.1', 2947,))
+        gps_thread.daemon = True
+        gps_thread.start()
+
     # Run packet processing in a background thread
     packet_processor = Thread(target=process_packets, args=(gpsd_object,))
     packet_processor.daemon = True
     packet_processor.start()
-
-    if gpsd:
-        gps_object = GPS()
-        gps_thread = Thread(target=gps_object.start, args=('127.0.0.1', 2947,))
-        gps_thread.daemon = True
-        gps_thread.start()
 
     receive_and_process_data(usb_ctx, usb_handle, interval)
 
