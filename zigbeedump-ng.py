@@ -2,6 +2,7 @@
 
 import signal
 import usb1
+import pkgutil
 import time
 import sys
 import gps
@@ -27,9 +28,18 @@ CLEAR_SCREEN_CURSOR_TO_TOP = '\x1b[2J\x1b[H'
 CURSOR_HIDE = '\x1b[?25l'
 CURSOR_SHOW = '\x1b[?25h'
 
+IEEE802154_DAT  = 0x01
+IEEE802154_ACK  = 0x02
+IEEE802154_CMD  = 0x03
+IEEE802154_RES  = 0x04
+IEEE802154_MUP  = 0x05
+IEEE802154_FRG  = 0x06
+IEEE802154_EXT  = 0x07
+
 signal_exit = False
 gpsd = False
 outfile = None
+oui_table = None
 
 packet_queue = queue.Queue()
 
@@ -40,6 +50,101 @@ cur_channel_index = 0
 
 aps = {}
 stas = {}
+
+last_total_count = {}
+
+class Count:
+    def __init__(self):
+        self.beacons = 0
+        self.data    = 0
+
+class AP:
+    def __init__(self, bssid, rssi, channel):
+        self.bssid       = bssid
+        self.manu        = ""
+        self.rssi        = rssi
+        self.clients     = set([])
+        self.cur_channel = channel
+        self.rate        = 1
+        self.enc         = ""
+        self.total       = 0
+        self.beacons     = 0
+        self.data        = 0
+        self.pps         = 0
+
+    def __str__(self):
+        return f"{self.bssid:<23}{self.rssi:>5}{self.beacons:>10}{self.data:>8} {self.pps:>3} {self.cur_channel:>4} {self.rate:>4} {self.enc:>5} {self.manu:>20}"
+    
+
+class STA:
+    def __init__(self, mac, bssid=None, rssi=""):
+        self.mac = mac
+        self.bssid = bssid
+        self.rssi = rssi
+        self.rate = 1
+        self.lost = 0
+        self.total = 0
+        self.probe = ""
+
+    def __str__(self):
+        if not self.bssid:
+            self.bssid = '(Not associated)'
+        return f"{self.bssid:<23}{self.mac:>23} {self.rssi:>5}{self.rate:>5}{self.lost:>7}   {self.total:>8}    {self.probe:<20}"
+
+def load_oui(oui_file: str, running_pyz: bool) -> dict:
+    """
+    Function to load an OUI dictionary from an OUI file.
+    The OUI dictionary will store the first 6 characters of the OUI as the key and the manufacturer name as the value.
+    """
+    oui_table = {}
+
+    try:
+        lines = None
+        if running_pyz:
+            # Load from within the .pyz archive
+            print('[+] Loading OUI from archive')
+            data = pkgutil.get_data(__name__, oui_file)  # Load the file from the archive
+            if data is None:
+                raise FileNotFoundError(f"[!] {oui_file} not found in the .pyz archive")
+            lines = data.decode('utf-8').splitlines()
+        else:
+            # Load from the file system
+            print(f'[+] Loading OUI from file system: {oui_file}')
+            with open(oui_file, 'r') as f_oui:
+                lines = f_oui.readlines()
+
+        current_oui = None
+        current_manufacturer = None
+
+        # Process the OUI file contents line by line
+        for line in lines:
+            # Ignore empty lines or lines with just spaces
+            if line.strip() == '':
+                continue
+            
+            # Check if the line contains OUI information (format: xx-xx-xx (hex))
+            if '(hex)' in line:
+                # Extract the first 6 characters (OUI) and remove any spaces/hyphens
+                current_oui = line.split()[0].replace('-', '').lower()
+                current_manufacturer = line.split('\t')[-1].strip()  # Extract the manufacturer name
+            
+            # Check if the line contains additional manufacturer info (such as address)
+            elif current_oui is not None and current_manufacturer is not None:
+                # Continue reading manufacturer address lines and skip them (or store if needed)
+                if line.startswith('\t'):
+                    continue
+                else:
+                    # Store the OUI and manufacturer in the dictionary
+                    oui_table[current_oui] = current_manufacturer
+                    current_oui = None
+                    current_manufacturer = None
+
+    except FileNotFoundError:
+        print(f'[!] File Not Found: {oui_file}')
+        return None
+
+    return oui_table
+
 
 def signal_handler(sig, frame):
     global signal_exit
@@ -88,19 +193,18 @@ def show_cursor() -> None:
     sys.stdout.flush()
 
 def display(aps: dict, stas: dict, gps_object: GPS) -> None:
-    global signal_exit, cur_channel, gpsd
+    global signal_exit, cur_channel, gpsd, last_total_count
 
     start_time = time.time()
 
     timeout = 60
     bssid = None
     targets = None
-    last_total_count = {}
 
     # Define maximum widths for each column
     max_widths = {
-        'BSSID': 19, 'PWR': 5, 'RXQ': 5, 'Beacons': 10, '#Data': 7,
-        '#/s': 5, 'CH': 4, 'MB': 4, 'ENC': 5, 'CIPHER': 8, 'AUTH': 6, 'ESSID': 20
+        'BSSID': 23, 'PWR': 5, 'Beacons': 9, '#Data': 4,
+        '#/s': 5, 'CH': 4, 'MB': 4, 'ENC': 5, 'MANUFACTURER':20
     }
 
     # Define the header and row formats using the maximum widths
@@ -109,7 +213,7 @@ def display(aps: dict, stas: dict, gps_object: GPS) -> None:
 
     # Define maximum widths for each column
     max_widths = {
-        'BSSID': 19, 'STA': 19, 'PWR': 5, 'Rate': 8, 'Lost': 7,
+        'BSSID': 23, 'STA': 23, 'PWR': 5, 'Rate': 8, 'Lost': 7,
         'Frames': 8, 'Probe': 20
     }
 
@@ -151,8 +255,8 @@ def display(aps: dict, stas: dict, gps_object: GPS) -> None:
             
             # If bssid filtering is applied, and our bssid does not match we 
             # won't display the device
-            if bssid and bssid != bssid:
-                continue
+            # if bssid and bssid != bssid:
+            #    continue
 
             ap_line = str(ap) + '\n'
 
@@ -174,9 +278,10 @@ def display(aps: dict, stas: dict, gps_object: GPS) -> None:
 
                 display_body += ap_line
 
-            # still want another new line even if timeout is reached for cur ap
-            display_body += "\n"
-            
+        # still want another new line even if timeout is reached for cur ap
+        display_body += "\n"
+        
+        if stas:
             # Print the footer
             display_body += " " + footer + "\n\n"
 
@@ -207,8 +312,8 @@ def display(aps: dict, stas: dict, gps_object: GPS) -> None:
                 else:
                     sta.probe = ""
 
-            # still want another new line even if timeout is reached for cur sta
-            display_body += "\n"
+                # still want another new line even if timeout is reached for cur sta
+                display_body += "\n"
 
         sys.stdout.write(display_body)
         sys.stdout.flush()
@@ -326,22 +431,6 @@ pcap_hdr = struct.pack(
     192              # network (or 195 for IEEE 802.15.4 depending on choice)
 )
 
-def close_usb_sniffer(handle: usb1.USBDeviceHandle):
-    try:
-        # Stop sniffing
-        #handle.controlWrite(0x40, 209, 0, 0, b'', TIMEOUT)
-        # Power off radio, wIndex = 0
-        #handle.controlWrite(0x40, 197, 0, 0, b'', TIMEOUT)
-        # Release interface and close the handle
-        #handle.releaseInterface(0)
-        handle.close()
-        
-        # Exit libusb
-        #handle.getContext().exit()
-        
-    except usb1.USBError as e:
-        print("Error closing USB sniffer:", e)
-
 def init_usb_sniffer(channel):
     usb_buf = bytearray(BUF_SIZE)
 
@@ -448,7 +537,7 @@ def packet_handler(buf: bytes, gpsd_object: GPS):
     if rssi_signed < -128: rssi_signed = -128
     if 127 < lqi_signed: lqi_signed = 127
     if lqi_signed < -128: lqi_signed = -128
-    print(f"RSSI: {rssi_signed}")
+    # print(f"RSSI: {rssi_signed}")
 
     # Write PPI headers (placeholder for actual function) 4th is channel
     ppi = write_ppi_headers(0, 1, cur_channel, rssi_signed, lqi_signed, gpsLat, gpsLon, gpsAlt)
@@ -466,26 +555,309 @@ def packet_handler(buf: bytes, gpsd_object: GPS):
     f_out.flush()
     f_out.close()
 
-    parse_packet(usb.packet_data[:-2])
+    parse_packet(usb.packet_data[:-2], rssi_signed)
 
-def parse_packet(pkt: bytes):
-    global aps, stas
+def get_manu(mac: str):
+    global oui_table
 
-    offset = 0
+    manu = ""
+    oui = mac.replace(':','').upper()
+    manu = oui_table.get(oui, "")
 
+    return manu
 
-    offset += 2
-    if offset < len(pkt):
-        return
-    fc = struct.unpack('<H', pkt[:offset])[0]
+def parse_packet(pkt_data: bytes, rssi: int):
+    global aps, stas, oui_table
+
+    rate = 1
+
+    def reverse_bytes(byte_string):
+        return byte_string[::-1]
     
-    if offset + 1 < len(pkt):
-        return
-    seq_no = pkt[offset]
+    def bytes_to_mac(bytes: bytes) -> str:
+        return ':'.join('{:02x}'.format(b) for b in bytes)
 
-    if offset + 2 < len(pkt):
+    pkt_len = len(pkt_data)
+    if pkt_len < 3:
         return
-    source_pan = pkt[offset + 2] + pkt[offset + 1]
+    
+    index = 0
+    frame_control = struct.unpack_from('<H', pkt_data, index)[0]
+    index += 2
+
+    frame_type = frame_control & 0x0007
+    security_enable = bool((frame_control & 0x0008) >> 3)
+    frame_pending = bool((frame_control & 0x0010) >> 4)
+    ack_request = bool((frame_control & 0x0020) >> 5)
+    pan_id_compression = bool((frame_control & 0x0040) >> 6)
+    seqno_suppression = bool((frame_control & 0x0100) >> 8)
+    ie_present = bool((frame_control & 0x0200) >> 9)
+    dst_addr_mode = (frame_control & 0x0c00) >> 10
+    frame_version = (frame_control & 0x3000) >> 12
+    src_addr_mode = (frame_control & 0xc000) >> 14
+
+    seqno = 0
+    if not seqno_suppression:
+        seqno = pkt_data[index]
+        index += 1
+
+    dst_pan = src_pan = dst16 = src16 = dst64 = src64 = b''
+    sta_cur = None
+    ap_cur  = None
+
+    # Handling addressing fields based on the address mode
+    if dst_addr_mode:
+        dst_pan_present = True
+        if dst_addr_mode == 0x2:  # Short address
+            if len(pkt_data) < index + 4:
+                return None
+            dst_pan = reverse_bytes(pkt_data[index:index+2])
+            if src_addr_mode != 0:
+                dst16 = reverse_bytes(pkt_data[index+2:index+4])
+                index += 4
+            else:
+                dst16 = dst_pan
+                index += 2
+        elif dst_addr_mode == 0x3:  # Extended address
+            if len(pkt_data) < index + 10:
+                return None
+            dst_pan = reverse_bytes(pkt_data[index:index+2])
+            dst64 = reverse_bytes(pkt_data[index+2:index+8])
+            dst64 = bytes_to_mac(dst64)
+            index += 10
+
+    if src_addr_mode:
+        src_pan_present = not pan_id_compression
+        if src_addr_mode == 0x2:  # Short address
+            if src_pan_present:
+                if len(pkt_data) < index + 2:
+                    return None
+                src_pan = reverse_bytes(pkt_data[index:index+2])
+                index += 2
+            if len(pkt_data) < index + 2:
+                return None
+            src16 = reverse_bytes(pkt_data[index:index+2])
+            index += 2
+        elif src_addr_mode == 0x3:  # Extended address
+            if src_pan_present:
+                if len(pkt_data) < index + 2:
+                    return None
+                src_pan = reverse_bytes(pkt_data[index:index+2])
+                index += 2
+            if len(pkt_data) < index + 8:
+                return None
+            src64 = reverse_bytes(pkt_data[index:index+8])
+            src64 = bytes_to_mac(src64)
+            index += 8
+
+    match frame_type:
+        case 0x00: # Beacon
+
+            if len(pkt_data) < index + 2:
+                return None
+            superframe_spec = pkt_data[index : index + 2]
+            index += 2
+            if len(pkt_data) < index + 1:
+                return None
+            gts = pkt_data[index : index + 1]
+            index += 1
+            if len(pkt_data) < index + 1:
+                return None
+            pending_addrs = pkt_data[index : index + 1]
+            index += 1
+            data = pkt_data[index:]
+
+            if src64:
+                ap_cur = aps.get(src64)
+                if not ap_cur:
+                    aps[src64] = AP(src64, rssi, cur_channel)
+                    ap_cur = aps[src64]
+                
+                if dst64:
+                    ap_cur.clients.add(dst64)
+                    sta_cur = stas.get(dst64)  
+                    if not sta_cur:  
+                        stas[dst64] = STA(dst64)
+                        sta_cur = stas[dst64]
+                    sta_cur.bssid = src64
+
+            if ap_cur:
+                ap_cur.manu = get_manu(ap_cur.bssid)
+                ap_cur.total += 1
+                ap_cur.last_seen = time.time()
+                ap_cur.beacons += 1
+
+            if sta_cur:
+                sta_cur.total += 1
+                sta_cur.last_seen = time.time()
+
+        case 0x03: # Command
+
+            if len(pkt_data) < index + 1:
+                return None
+            command_id = pkt_data[index]
+            index += 1
+            if len(pkt_data) < index + 4:
+                return None
+            frame_counter = pkt_data[index:index+4]
+            index += 4
+            if len(pkt_data) < index + 1:
+                return None
+            key_sequence_counter = pkt_data[index:index+1]
+            index += 1
+            mic_len = 8
+            mic = pkt_data[-mic_len:]
+            payload = pkt_data[index:-mic_len]
+            payload_start = index
+
+        case (0x01, 0x07): # Data/Extended
+            if frame_version == 0x00: # 802.15.4-2003
+                if seqno_suppression:
+                    return None # sequence number suppression is invalid for 802.15.4-2003 and 2006
+                if len(pkt_data) < index + 8:
+                    return None
+                
+                if pkt_data[index : index + 2] == b'\x48\x02': # Zigbee Network layer data
+                    frame_control = struct.unpack_from('<H', pkt_data, index)[0]
+                    index += 2
+                    frame_type = frame_control & 0x0003
+                    protocol_versio= frame_control & 0x003C
+                    discover_route = frame_control & 0x00C0
+                    multicast = frame_control & 0x0100
+                    security_enable = frame_control & 0x0200
+                    source_route = frame_control & 0x0400
+                    destination = frame_control & 0x0800
+                    extended_source= frame_control & 0x1000
+                    end_dev_initiator = frame_control & 0x2000
+
+                    dst = pkt_data[index + 1: index + 2] + pkt_data[index : index + 1]
+                    index += 2
+                    src = pkt_data[index + 1: index + 2] + pkt_data[index : index + 1]
+                    index += 2
+
+                    radius = pkt_data[index]
+                    seqno = pkt_data[index + 1]
+                    index += 2
+
+                    security_control = pkt_data[index]
+                    index += 1
+
+                    extended_source = reverse_bytes(pkt_data[index:index+8])
+                    extended_source = bytes_to_mac(extended_source)
+                    index += 8
+
+                    key_sequence_no = pkt_data[index]
+                    index += 1
+
+                    mic = pkt_data[:-4]
+                    pkt_data = pkt_data[index:-4]
+
+                    payload = pkt_data
+                    ap_cur = None
+                    if extended_source:
+                        ap_cur = aps.get(extended_source)
+                        if not ap_cur:
+                            aps[extended_source] = AP(extended_source, rssi, cur_channel)
+                            ap_cur = aps[extended_source]
+                        ap_cur.manu = get_manu(ap_cur.bssid)
+                        ap_cur.data += 1
+                        ap_cur.total += 1
+                        ap_cur.last_seen = time.time()
+
+                    return None
+
+                frame_counter = pkt_data[index:index+4]
+                index += 4
+                if len(pkt_data) < index + 1:
+                    return None
+                key_sequence_counter = pkt_data[index:index+1]
+                index += 1
+                mic_len = 8
+                mic = pkt_data[-mic_len:]
+                payload = pkt_data[index:-mic_len]
+                payload_start = index
+                security_level = -1
+                key_id_mode = -1
+                frame_counter_suppression = False
+                asn = -1
+                key_source = b''
+                key_index = -1
+                security_control = 0
+            else:    # v1 == 802.15.4-2006
+                frame_counter_suppression=False
+                key_source = b''
+                key_index = b''
+                security_level = 0
+                security_control = 0
+                key_id_mode = 0
+                frame_counter = b'\x00\x00\x00\x00'
+
+                if len(pkt_data) < index + 1:
+                    return None
+                security_control = pkt_data[index]
+                security_level = security_control & 0x07
+                key_id_mode = (security_control & 0x18) >> 3
+                frame_counter_suppression = bool((security_control & 0x20) >> 5)
+                asn = (security_control & 0x40) >> 6
+                index += 1
+                if not frame_counter_suppression:
+                    if len(pkt_data) < index + 4:
+                        return None
+                    frame_counter = pkt_data[index:index+4]
+                    index += 4
+
+                # Parsing key identifier depending on key_id_mode
+                if key_id_mode != 0:
+                    if key_id_mode == 1:
+                        if len(pkt_data) < index + 1:
+                            return None
+                        key_index = pkt_data[index]
+                        index += 1
+                        key_source = b''
+                    elif key_id_mode in [2, 3]:
+                        if len(pkt_data) < index + 4:
+                            return None
+                        key_source = pkt_data[index:index+4]
+                        index += 4
+                        if len(pkt_data) < index + 1:
+                            return None
+                        key_index = pkt_data[index]
+                        index += 1
+
+                # https://research.kudelskisecurity.com/2017/11/08/zigbee-security-basics-part-2/
+
+                mic = b''
+                if security_level == 0x07:
+                    mic_len = 16
+                elif security_level == 0x06:
+                    mic_len = 8
+                elif security_level == 0x05:
+                    mic_len = 4
+                elif security_level == 0x04:
+                    mic_len = 0
+                elif security_level == 0x03:
+                    mic_len = 16
+                elif security_level == 0x02:
+                    mic_len = 8
+                elif security_level == 0x01:
+                    mic_len = 4
+                elif security_level == 0x00:
+                    mic_len = 0
+                else:
+                    
+                    return None
+
+                if mic_len > 0:
+                    mic = pkt_data[-mic_len:]
+                    payload = pkt_data[index:-mic_len]
+                    payload_start = index
+                else:
+                    payload = pkt_data[index:]
+                    payload_start = index
+
+        case _:
+            return
+
     
 def process_packets(gpsd_object: GPS):
     global signal_exit
@@ -551,7 +923,7 @@ def receive_and_process_data(usb_ctx: usb1.USBContext, handle: usb1.USBDeviceHan
                 cur_channel_index = (cur_channel_index + 1) % num_channels
                 cur_channel = channels_list[cur_channel_index]
 
-                print(f"Changing channel to: {cur_channel}")
+                # print(f"Changing channel to: {cur_channel}")
 
                 handle.controlWrite(0x40, 210, 0, 0, bytearray([cur_channel]), TIMEOUT)
                 handle.controlWrite(0x40, 210, 0, 1, b'\x00', TIMEOUT)
@@ -564,12 +936,13 @@ def receive_and_process_data(usb_ctx: usb1.USBContext, handle: usb1.USBDeviceHan
         handle.close()
 
 def main(args):
-    global outfile, channels_list, num_channels, gpsd, aps, stas
+    global outfile, oui_table, channels_list, num_channels, gpsd, aps, stas
 
     gpsd     = args.gpsd
     outfile  = args.outfile
     interval = args.interval
     gpsd_object = None
+    oui_table = load_oui('oui.txt', False)
 
     usb_handle, usb_ctx = init_usb_sniffer(cur_channel)
 
@@ -589,15 +962,15 @@ def main(args):
 
     hide_cursor()
 
-    """display_thread = Thread(target=display, args=(aps, stas,))
-    display_thread.daemon = True
-    display_thread.start()"""
-
     if gpsd:
         gpsd_object = GPS()
         gps_thread = Thread(target=gpsd_object.start, args=('127.0.0.1', 2947,))
         gps_thread.daemon = True
         gps_thread.start()
+
+    display_thread = Thread(target=display, args=(aps, stas, gpsd_object,))
+    display_thread.daemon = True
+    display_thread.start()
 
     # Run packet processing in a background thread
     packet_processor = Thread(target=process_packets, args=(gpsd_object,))
